@@ -1,148 +1,138 @@
-import math
+import telebot
 import sqlite3
-import logging
 import requests
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
+import math
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from config import BOT_TOKEN, DATABASE_FILE, SEARCH_RADIUS_KM
 
-# Loglarni sozlash
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = telebot.TeleBot(BOT_TOKEN)
+user_locations = {}
 
-# Botni ishga tushirish
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher(bot)
-
-# Ma'lumotlar bazasidan parkovka ma'lumotlarini olish
 def get_parkings_data():
+    """Bazadan parkovka ma'lumotlarini olish."""
     try:
         with sqlite3.connect(DATABASE_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name, latitude, longitude, address FROM parkings")
             return [{"name": row[0], "latitude": float(row[1]), "longitude": float(row[2]), "address": row[3]} for row in cursor.fetchall()]
     except sqlite3.Error as e:
-        logger.error(f"Ma'lumotlar bazasi xatosi: {e}")
+        print(f"Database error: {e}")
         return []
 
-# Haversine formulasi orqali masofani hisoblash
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Yer radiusi (km)
+    """Ikki nuqta orasidagi masofani km da hisoblash (Haversine formula)."""
+    R = 6371  
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    delta_phi, delta_lambda = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = (math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-# OSRM API orqali haydash masofasi va vaqtini hisoblash
 def get_driving_distance_osrm(origin, destination):
+    """OSRM orqali haydash masofasi va vaqtini olish."""
     url = f"http://router.project-osrm.org/route/v1/driving/{origin[1]},{origin[0]};{destination[1]},{destination[0]}"
     try:
         response = requests.get(url).json()
         if response.get("code") == "Ok":
-            distance_km = response['routes'][0]['distance'] / 1000
-            duration_min = response['routes'][0]['duration'] / 60
-            return f"{distance_km:.1f} km", f"{duration_min:.0f} min"
+            return f"{response['routes'][0]['distance'] / 1000:.1f} km", f"{response['routes'][0]['duration'] / 60:.0f} min"
     except requests.RequestException as e:
-        logger.error(f"OSRM API so'rov xatosi: {e}")
+        print(f"OSRM API error: {e}")
     return None, None
 
-# Start komandasi
-@dp.message_handler(commands=['start', 'menu'])
-async def menu(message: types.Message):
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True).add(
-        KeyboardButton("Geolokatsiyani yuborish", request_location=True)
-    )
-    await message.answer("Quyidagi menyudan tanlang:", reply_markup=keyboard)
+@bot.message_handler(commands=['start', 'menu'])
+def menu(message):
+    """Foydalanuvchiga lokatsiya so‘rash tugmasini chiqarish."""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(KeyboardButton("📍 Geolokatsiyani yuborish", request_location=True))
+    bot.send_message(message.chat.id, "Quyidagi tugmani bosing:", reply_markup=keyboard)
 
-# Foydalanuvchining joylashuvini qabul qilish
-user_locations = {}
-
-@dp.message_handler(content_types=types.ContentType.LOCATION)
-async def handle_location(message: types.Message):
+@bot.message_handler(content_types=['location'])
+def handle_location(message):
+    """Foydalanuvchi lokatsiyasini qabul qilish va tanlov tugmalarini chiqarish."""
     user_lat, user_lon = message.location.latitude, message.location.longitude
-    user_locations[message.from_user.id] = (user_lat, user_lon)
-    
-    # Inline buttonlarni yaratish
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("4 km radiusdagi parkovkalar", callback_data="show_nearby_parkings"))
-    keyboard.add(InlineKeyboardButton("Eng yaqin parkovka", callback_data="show_nearest_parking"))
-    
-    await message.answer("Qaysi variantni tanlaysiz?", reply_markup=keyboard)
+    user_locations[message.chat.id] = (user_lat, user_lon)
 
-# 4 km radiusdagi parkovkalarni ko'rsatish
-@dp.callback_query_handler(lambda c: c.data == "show_nearby_parkings")
-async def show_nearby_parkings(callback_query: types.CallbackQuery):
-    user_lat, user_lon = user_locations.get(callback_query.from_user.id, (None, None))
-    user_location = (user_lat, user_lon)
-    
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("3 km radiusdagi parkovkalar", "Eng yaqin parkovka")
+
+    bot.send_message(message.chat.id, "Qaysi variantni tanlaysiz?", reply_markup=keyboard)
+import time
+
+@bot.message_handler(func=lambda message: message.text == "3 km radiusdagi parkovkalar")
+def show_nearby_parkings(message):
+    """4 km radiusdagi barcha parkovkalarni chiqarish."""
+    user_lat, user_lon = user_locations.get(message.chat.id, (None, None))
     if user_lat is None or user_lon is None:
-        await callback_query.message.answer("Iltimos, avval geolokatsiyani yuboring.")
+        bot.send_message(message.chat.id, "📍 Geolokatsiyani yuboring.")
         return
+
+    loading_texts = ["⏳ Yuklanmoqda.", "⏳ Yuklanmoqda..", "⏳ Yuklanmoqda..."]
+    loading_message = bot.send_message(message.chat.id, loading_texts[0])
+
+    last_text = loading_texts[0] 
+    for i in range(9):  
+        new_text = loading_texts[i % 3]
+        if new_text != last_text:
+            bot.edit_message_text(chat_id=message.chat.id, message_id=loading_message.message_id, text=new_text)
+            last_text = new_text
 
     parkings = get_parkings_data()
     nearby = []
-    
-    for parking in parkings:
-        parking_location = (parking['latitude'], parking['longitude'])
-        distance_km = haversine(user_lat, user_lon, parking['latitude'], parking['longitude'])
+
+    for p in parkings:
+        distance_km = haversine(user_lat, user_lon, p['latitude'], p['longitude'])
         if distance_km <= SEARCH_RADIUS_KM:
-            driving_distance, driving_duration = get_driving_distance_osrm(user_location, parking_location)
+            driving_distance, driving_duration = get_driving_distance_osrm((user_lat, user_lon), (p['latitude'], p['longitude']))
             if driving_distance and driving_duration:
-                parking.update({"driving_distance": driving_distance, "driving_duration": driving_duration})
-                nearby.append(parking)
-    
+                p.update({"driving_distance": driving_distance, "driving_duration": driving_duration})
+                nearby.append(p)
+
     if nearby:
-        nearby.sort(key=lambda x: float(x["driving_distance"].split()[0]))
+        nearby.sort(key=lambda x: haversine(user_lat, user_lon, x['latitude'], x['longitude']))
         response = "\n\n".join(
-            [f"<b>{i+1}. {parking['name']}</b>\n"
-             f"📍 <a href='http://www.google.com/maps/place/{parking['latitude']},{parking['longitude']}'>Manzil</a>\n"
-             f"🚗 Masofa: {parking['driving_distance']}\n"
-             f"⏳ Vaqt: {parking['driving_duration']}\n"
-             f"🏠 Manzil: {parking['address']}"
-             for i, parking in enumerate(nearby)]
+            [f"<b>{i+1}. {p['name']}</b>\n"
+             f"📍 <a href='http://www.google.com/maps/place/{p['latitude']},{p['longitude']}'>Manzil</a>\n"
+             f"🚗 Masofa: {p['driving_distance']}\n"
+             f"⏳ Vaqt: {p['driving_duration']}\n"
+             f"🏠 Manzil: {p['address']}"
+             for i, p in enumerate(nearby)]
         )
     else:
-        response = f"{SEARCH_RADIUS_KM} km radiusda parkovkalar topilmadi. Radiusni kengaytirish uchun qayta urinib ko'ring."
-
-    await bot.send_message(callback_query.from_user.id, response, parse_mode="HTML", disable_web_page_preview=True)
-
-# Eng yaqin parkovkani ko'rsatish
-@dp.callback_query_handler(lambda c: c.data == "show_nearest_parking")
-async def show_nearest_parking(callback_query: types.CallbackQuery):
-    user_lat, user_lon = user_locations.get(callback_query.from_user.id, (None, None))
-    user_location = (user_lat, user_lon)
+        response = "❌ 4 km radiusda parkovkalar topilmadi."       
+    bot.send_message(message.chat.id, response, parse_mode="HTML", disable_web_page_preview=True)
+    bot.delete_message(message.chat.id, loading_message.message_id)
     
+
+
+@bot.message_handler(func=lambda message: message.text == "Eng yaqin parkovka")
+def show_nearest_parking(message):
+    """Eng yaqin parkovkani chiqarish."""
+    user_lat, user_lon = user_locations.get(message.chat.id, (None, None))
     if user_lat is None or user_lon is None:
-        await callback_query.message.answer("Iltimos, avval geolokatsiyani yuboring.")
+        bot.send_message(message.chat.id, "Geolokatsiyani yuboring.")
         return
     
     parkings = get_parkings_data()
-    nearest_parking = None
-    min_distance = float('inf')
+    if not parkings:
+        bot.send_message(message.chat.id, "Parkovkalar bazasi bo‘sh.")
+        return
 
-    for parking in parkings:
-        parking_location = (parking['latitude'], parking['longitude'])
-        distance_km = haversine(user_lat, user_lon, parking['latitude'], parking['longitude'])
-        if distance_km < min_distance:
-            min_distance = distance_km
-            nearest_parking = parking
+    nearest_parking = min(
+        parkings, key=lambda p: haversine(user_lat, user_lon, p['latitude'], p['longitude'])
+    )
 
-    if nearest_parking:
-        driving_distance, driving_duration = get_driving_distance_osrm(user_location, (nearest_parking['latitude'], nearest_parking['longitude']))
-        response = (
-            f"<b>{nearest_parking['name']}</b>\n"
-            f"📍 <a href='http://www.google.com/maps/place/{nearest_parking['latitude']},{nearest_parking['longitude']}'>Manzil</a>\n"
-            f"🚗 Masofa: {driving_distance if driving_distance else 'Noma’lum'}\n"
-            f"⏳ Vaqt: {driving_duration if driving_duration else 'Noma’lum'}\n"
-            f"🏠 Manzil: {nearest_parking['address']}"
-        )
-    else:
-        response = "Yaqin atrofda parkovka topilmadi."
+    driving_distance, driving_duration = get_driving_distance_osrm((user_lat, user_lon), (nearest_parking['latitude'], nearest_parking['longitude']))
+    if driving_distance and driving_duration:
+        nearest_parking.update({"driving_distance": driving_distance, "driving_duration": driving_duration})
 
-    await callback_query.message.answer(response, parse_mode="HTML", disable_web_page_preview=True)
+    response = (
+        f"<b>{nearest_parking['name']}</b>\n"
+        f"📍 <a href='http://www.google.com/maps/place/{nearest_parking['latitude']},{nearest_parking['longitude']}'>Manzil</a>\n"
+        f"🚗 Masofa: {nearest_parking['driving_distance']}\n"
+        f"⏳ Vaqt: {nearest_parking['driving_duration']}\n"
+        f"🏠 Manzil: {nearest_parking['address']}"
+    )
 
-# Botni ishga tushirish
-if __name__ == '__main__':
-   executor.start_polling(dp, skip_updates=True)
+    bot.send_message(message.chat.id, response, parse_mode="HTML", disable_web_page_preview=True)
+
+if __name__ == "__main__":
+    bot.polling(none_stop=True)
